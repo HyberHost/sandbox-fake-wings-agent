@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory)] [string]$ServerId,
+    [int]$Port = 27015,
     [string]$SteamUser = "",        # dedicated Steam account username
     [string]$SteamPass = ""         # password (plain text for automation)
 )
@@ -38,3 +39,28 @@ Write-Host "Installing/updating S&Box server..."
     +quit
 
 Write-Host "Installation finished."
+
+# Persist runtime metadata (port, last_install)
+$MetaPath = "$Base\server.json"
+$meta = @{}
+if (Test-Path $MetaPath) {
+    try {
+        $meta = Get-Content $MetaPath | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $meta = @{}
+    }
+}
+
+# Support both hashtable/dictionary and PSCustomObject from ConvertFrom-Json
+if ($meta -is [System.Collections.IDictionary]) {
+    $meta['port'] = $Port
+    $meta['last_install'] = (Get-Date).ToString("o")
+    $out = [PSCustomObject]$meta
+} else {
+    $meta | Add-Member -NotePropertyName port -NotePropertyValue $Port -Force
+    $meta | Add-Member -NotePropertyName last_install -NotePropertyValue (Get-Date).ToString("o") -Force
+    $out = $meta
+}
+
+$out | ConvertTo-Json | Out-File -Encoding UTF8 $MetaPath0
+Write-Host "Saved server metadata to $MetaPath"
