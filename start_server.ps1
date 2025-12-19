@@ -62,5 +62,5 @@ if ($meta -is [System.Collections.IDictionary]) {
     $out = $meta
 }
 
-$out | ConvertTo-Json | Out-File -Encoding UTF8 $MetaPath0
+$out | ConvertTo-Json | Out-File -FilePath $MetaPath -Encoding UTF8
 Write-Host "Saved server metadata to $MetaPath"
