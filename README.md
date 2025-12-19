@@ -10,8 +10,8 @@ This repository contains simple PowerShell scripts in the `Agent` folder to crea
 **Agent scripts**
 - `Agent/create_server.ps1` — create server directories and metadata.
 - `Agent/install_server.ps1` — run SteamCMD to install/update the server files.
-- `Agent/start_server.ps1` — installs/updates via SteamCMD and persists metadata; can be extended to launch the server binary.
-- `Agent/stop_server.ps1` — stops the server by reading `server.pid`.
+- `Agent/start_server.ps1` — installs/updates via SteamCMD, launches the server binary, and persists runtime metadata to `server.json`.
+- `Agent/stop_server.ps1` — stops the server by reading `server.json` (preferred) or falling back to `server.pid`.
 
 Paths in this repo are relative to the repository root. See the script files in the `Agent` folder for implementation details.
 
@@ -28,18 +28,25 @@ Install/update server files (uses SteamCMD via `C:\Tools\steamcmd.exe`):
 powershell -ExecutionPolicy Bypass -File C:\Agent\install_server.ps1 -ServerId test1234
 ```
 
-Start the server (this script currently installs/updates and writes metadata; pass a port if desired):
+Start the server (S&Box startup accepts gamemode and hostname from envs/params; `STEAM_GAME_TOKEN` is not yet available and is ignored for now):
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Agent\start_server.ps1 -ServerId test1234 -Port 27015
+# Example: set spoofed envs in PowerShell (temporary for this shell)
+$env:STEAM_LOGIN = 'mysteamuser mypassword'  # steam login for install/update (steamcmd)
+$env:SBOX_GAME = 'facepunch.walker'
+$env:SBOX_HOSTNAME = 'My Dedicated Server'
+
+powershell -ExecutionPolicy Bypass -File C:\Agent\start_server.ps1 -ServerId test1234
 ```
 
-Stop the server (reads `C:\Servers\sbox-test1234\server.pid` and stops the process id listed there):
+Stop the server (reads `C:\Servers\sbox-test1234\server.json` for the PID and stops it):
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Agent\stop_server.ps1 -ServerId test1234
 ```
 
 **Notes & troubleshooting**
-- If you see "A parameter cannot be found that matches parameter name 'Port'", ensure you're running the updated `Agent/start_server.ps1` that accepts `-Port`.
+- If you see an error mentioning `-Port`, note that `Agent/start_server.ps1` no longer accepts a `-Port` parameter; ports are handled by S&Box unless you explicitly need to set one.
 - The `start_server.ps1` script writes `server.json` metadata under `C:\Servers\sbox-test1234\server.json`. If you want the script to actually launch `sbox-server.exe` and write `server.pid`, request that change and it can be implemented.
 
 **install_node.ps1**

@@ -22,8 +22,17 @@ if (-not (Test-Path $SteamCMD)) {
     Copy-Item "C:\Tools\steamcmd.exe" $SteamCMD
 }
 
-# Determine login method
-if ($SteamUser -ne "" -and $SteamPass -ne "") {
+# Determine login method (supports spoofed ENV STEAM_LOGIN or username/password)
+$EnvSteamLogin = $env:STEAM_LOGIN
+if ($EnvSteamLogin -and $EnvSteamLogin -ne "") {
+    # If the env contains a space assume "user pass", else pass through as single token
+    if ($EnvSteamLogin -match '\s') {
+        $parts = $EnvSteamLogin -split '\s+',2
+        $LoginCmd = "+login $($parts[0]) $($parts[1])"
+    } else {
+        $LoginCmd = "+login $EnvSteamLogin"
+    }
+} elseif ($SteamUser -ne "" -and $SteamPass -ne "") {
     $LoginCmd = "+login $SteamUser $SteamPass"
 } else {
     $LoginCmd = "+login anonymous"
