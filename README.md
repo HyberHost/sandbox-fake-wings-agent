@@ -47,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File C:\Agent\stop_server.ps1 -ServerId test
 
 **Notes & troubleshooting**
 - If you see an error mentioning `-Port`, note that `Agent/start_server.ps1` no longer accepts a `-Port` parameter; ports are handled by S&Box unless you explicitly need to set one.
-- The `start_server.ps1` script writes `server.json` metadata under `C:\Servers\sbox-test1234\server.json`. If you want the script to actually launch `sbox-server.exe` and write `server.pid`, request that change and it can be implemented.
+- The `start_server.ps1` script writes `server.json` metadata under `C:\Servers\sbox-test1234\server.json`. The metadata includes `pid`, `pid_start_time` and `instance_token` so the agent can validate that a running PID belongs to this instance (prevents killing/reusing the wrong process). If you want the script to also write a separate `server.pid` file, request that change.
 
 **install_node.ps1**
 To install required .NET runtimes and fetch the `Agent` folder from GitHub, run (from an elevated shell):

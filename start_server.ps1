@@ -103,10 +103,24 @@ if ($meta -is [System.Collections.IDictionary]) {
 }
 
 if ($existingPid) {
-    $proc = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
-    if ($proc) {
-        Write-Host "Server already running with PID $existingPid. Not starting another instance."
-        return
+    try {
+        $proc = Get-Process -Id $existingPid -ErrorAction Stop
+        # Compare process start time with recorded start time to avoid PID reuse collisions
+        $procStartTime = $proc.StartTime.ToString("o")
+        $metaStart = $null
+        if ($meta -is [System.Collections.IDictionary]) {
+            if ($meta.ContainsKey('pid_start_time')) { $metaStart = $meta['pid_start_time'] }
+        } else {
+            if ($meta.PSObject.Properties.Name -contains 'pid_start_time') { $metaStart = $meta.pid_start_time }
+        }
+        if ($metaStart -and $metaStart -eq $procStartTime) {
+            Write-Host "Server already running with PID $existingPid (start time matches). Not starting another instance."
+            return
+        } else {
+            Write-Host "PID $existingPid is running but start time does not match recorded start time (possible PID reuse). Proceeding to start a new instance."
+        }
+    } catch {
+        Write-Host "No process found with PID $existingPid. Proceeding to start."
     }
 }
 
@@ -135,19 +149,32 @@ Write-Host "Starting S&Box server: $ServerExe $ServerArgs"
 $proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgs -WorkingDirectory $GameDir -PassThru
 
 if ($proc -and $proc.Id) {
+    # Collect runtime identity (StartTime) and instance token to guard against PID reuse
+    try {
+        $procInfo = Get-Process -Id $proc.Id -ErrorAction Stop
+        $pidStart = $procInfo.StartTime.ToString("o")
+    } catch {
+        $pidStart = (Get-Date).ToString("o")
+    }
+    $instanceToken = [guid]::NewGuid().ToString()
+
     # update metadata with runtime info
     if ($meta -is [System.Collections.IDictionary]) {
         $meta['pid'] = $proc.Id
+        $meta['pid_start_time'] = $pidStart
+        $meta['instance_token'] = $instanceToken
         $meta['last_start'] = (Get-Date).ToString("o")
         $out = [PSCustomObject]$meta
     } else {
         $meta | Add-Member -NotePropertyName pid -NotePropertyValue $proc.Id -Force
+        $meta | Add-Member -NotePropertyName pid_start_time -NotePropertyValue $pidStart -Force
+        $meta | Add-Member -NotePropertyName instance_token -NotePropertyValue $instanceToken -Force
         $meta | Add-Member -NotePropertyName last_start -NotePropertyValue (Get-Date).ToString("o") -Force
         $out = $meta
     }
 
     $out | ConvertTo-Json | Out-File -FilePath $MetaPath -Encoding UTF8
-    Write-Host "Server started (PID $($proc.Id)), metadata updated."
+    Write-Host "Server started (PID $($proc.Id), start $pidStart), metadata updated (token $instanceToken)."
 } else {
     Write-Host "Failed to start server process."
 }
