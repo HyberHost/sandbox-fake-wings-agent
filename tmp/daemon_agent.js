@@ -25,6 +25,11 @@ const cors = require('cors');
 const os = require('os');
 const yaml = require('js-yaml');
 const WebSocket = require('ws');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+// In-memory denylist for websocket JTIs: jti -> timestamp (ms)
+const wsDenylist = new Map();
 
 const BASE = path.resolve(__dirname);
 const LOG_DIR = path.join(BASE, 'logs');
@@ -270,7 +275,22 @@ app.get('/api/system', (req, res) => {
     return res.json(response);
   }
 
+  // Provide both v1-style top-level system fields (used by Panel's SystemInformation view)
+  // and the `system` object for v2-like consumers. This keeps compatibility with Pterodactyl Panel.
+  const arch = process.arch;
+  const cpuCount = os.cpus ? os.cpus().length : 1;
+  const kernelVersion = os.release();
+  const osName = (config && (config.system && config.system.os)) ? config.system.os : os.type();
+
   const response = {
+    // v1-style compatible fields
+    version: '0.1.0-fake',
+    os: osName,
+    architecture: arch,
+    kernel_version: kernelVersion,
+    cpu_count: cpuCount,
+
+    // existing response body kept for richer clients
     debug: config?.debug ?? false,
     uuid: config?.uuid || process.env.WINGS_UUID || process.env.NODE_UUID || null,
     token_id: config?.token_id || process.env.WINGS_TOKEN_ID || null,
@@ -329,84 +349,176 @@ try {
     httpsServer = https.createServer({ key, cert }, app);
     httpsServer.listen(8080, '0.0.0.0', () => {
       log('Mock Wings daemon listening on https://0.0.0.0:8080 (using 4096-bit cert)');
-    // Setup WebSocket server upgrade handling for console websockets
-    const wss = new WebSocket.Server({ noServer: true });
-
-    httpsServer.on('upgrade', (req, socket, head) => {
-      try {
-        const url = new URL(req.url, `https://${req.headers.host}`);
-        const pathname = url.pathname;
-        const match = pathname.match(/^\/api\/servers\/([^\/]+)\/ws$/);
-        if (!match) {
-          socket.destroy();
-          return;
-        }
-        const serverId = match[1];
-
-        // Simple token auth: check query param 'token' or Authorization header
-        const tokenQuery = url.searchParams.get('token');
-        const authHeader = req.headers['authorization'] || '';
-        const bearer = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1].trim() : '';
-
-        // Read server metadata
-        const metaPath = path.join('C:', 'Servers', `sbox-${serverId}`, 'server.json');
-        let meta = null;
-        if (fs.existsSync(metaPath)) {
-          try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (e) { meta = null; }
-        }
-
-        // Validate PID exists and is running
-        const pidValid = meta && meta.pid && !isNaN(parseInt(meta.pid, 10)) && isRunning(meta);
-        if (!pidValid) {
-          // Reject upgrade
-          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-
-        // Validate token: accept if matches node token or instance_token
-        const nodeToken = getNodeToken();
-        const instanceToken = meta.instance_token || '';
-        if (nodeToken && bearer !== nodeToken && tokenQuery !== nodeToken && bearer !== instanceToken && tokenQuery !== instanceToken) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-
-        wss.handleUpgrade(req, socket, head, (ws) => {
-          wss.emit('connection', ws, req, serverId, meta);
-        });
-      } catch (e) {
-        socket.destroy();
-      }
     });
-
-    wss.on('connection', (ws, req, serverId, meta) => {
-      log('WebSocket console connected for', serverId, 'from', req.socket.remoteAddress);
-      // Send welcome message
-      ws.send(JSON.stringify({ type: 'welcome', server_id: serverId, pid: meta.pid }));
-
-      ws.on('message', (data) => {
-        // Treat incoming messages as stdin strings
-        let text = data;
-        if (Buffer.isBuffer(data)) text = data.toString('utf8');
-        const serverDir = path.join('C:', 'Servers', `sbox-${serverId}`);
-        const consoleLog = path.join(serverDir, 'console.log');
-        const ts = new Date().toISOString();
-        fs.appendFileSync(consoleLog, `${ts}Z WS ${text}\n`, 'utf8');
-        // Echo back a stubbed response
-        ws.send(JSON.stringify({ type: 'stdout', data: `Stub response: ${text}` }));
-      });
-
-      ws.on('close', () => {
-        log('WebSocket console disconnected for', serverId);
-      });
-    });
-
-  });
-    } else {
+  }
 }
 
+// POST /api/servers/:serverId/ws/authorize -> issues a websocket JWT for a user
+app.post('/api/servers/:serverId/ws/authorize', (req, res) => {
+  const serverId = req.params.serverId;
+  const body = req.body || {};
+  const user_uuid = body.user_uuid || body.user || null;
+  const permissions = Array.isArray(body.permissions) ? body.permissions : ['websocket.connect', 'control.console'];
+  const ttl = parseInt(body.ttl || 3600, 10);
+
+  const nodeToken = getNodeToken();
+  if (!nodeToken) return res.status(500).json({ error: 'node token not configured' });
+
+  if (!user_uuid) return res.status(400).json({ error: 'user_uuid required' });
+
+  // jti is md5(user_id + server_uuid)
+  const jti = crypto.createHash('md5').update(String(user_uuid) + String(serverId)).digest('hex');
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + ttl;
+
+  const payload = {
+    jti: jti,
+    user_uuid: user_uuid,
+    server_uuid: serverId,
+    permissions: permissions,
+    iat: iat,
+    exp: exp,
+  };
+
+  const token = jwt.sign(payload, nodeToken, { algorithm: 'HS256' });
+  return res.json({ token: token, socket: `wss://${req.headers.host}/api/servers/${serverId}/ws`, jti: jti, ttl: ttl });
+});
+
+// POST /api/servers/:serverId/ws/deny -> deny list JTIs
+app.post('/api/servers/:serverId/ws/deny', (req, res) => {
+  const data = req.body || {};
+  const jtis = Array.isArray(data.jtis) ? data.jtis : [];
+  const now = Date.now();
+  for (const jti of jtis) {
+    wsDenylist.set(jti, now);
+  }
+  log('Added JTIs to denylist for server', req.params.serverId, jtis);
+  return res.status(204).send();
+});
+
+// Helper to verify websocket token
+function verifyWsToken(tokenStr, serverId) {
+  const nodeToken = getNodeToken();
+  if (!nodeToken) return { valid: false, reason: 'node token not configured' };
+  try {
+    const payload = jwt.verify(tokenStr, nodeToken, { algorithms: ['HS256'] });
+    // Check server uuid
+    if (!payload.server_uuid || String(payload.server_uuid) !== String(serverId)) return { valid: false, reason: 'server uuid mismatch' };
+    // Check permissions
+    if (!Array.isArray(payload.permissions) || !payload.permissions.includes('websocket.connect')) return { valid: false, reason: 'missing websocket.connect permission' };
+    // Check jti not denylisted
+    if (payload.jti && wsDenylist.has(payload.jti)) {
+      return { valid: false, reason: 'jti denylisted' };
+    }
+    return { valid: true, payload: payload };
+  } catch (e) {
+    return { valid: false, reason: e.message };
+  }
+}
+
+// Setup a dedicated WebSocket handler that will be used for console connections.
+const wss = new WebSocket.Server({ noServer: true });
+
+httpsServer.on('upgrade', (req, socket, head) => {
+  try {
+    const url = new URL(req.url, `https://${req.headers.host}`);
+    const pathname = url.pathname;
+    const match = pathname.match(/^\/api\/servers\/([^\/]+)\/ws$/);
+    if (!match) {
+      socket.destroy();
+      return;
+    }
+    const serverId = match[1];
+
+    // Simple token auth: check query param 'token' or Authorization header
+    const tokenQuery = url.searchParams.get('token');
+    const authHeader = req.headers['authorization'] || '';
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1].trim() : '';
+
+    // Read server metadata
+    const metaPath = path.join('C:', 'Servers', `sbox-${serverId}`, 'server.json');
+    let meta = null;
+    if (fs.existsSync(metaPath)) {
+      try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (e) { meta = null; }
+    }
+
+    // Validate PID exists and is running
+    const pidValid = meta && meta.pid && !isNaN(parseInt(meta.pid, 10)) && isRunning(meta);
+    if (!pidValid) {
+      // Reject upgrade
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Validate token: accept if matches node token or instance_token
+    const nodeToken = getNodeToken();
+    const instanceToken = meta && meta.instance_token ? meta.instance_token : '';
+    if (nodeToken && bearer !== nodeToken && tokenQuery !== nodeToken && bearer !== instanceToken && tokenQuery !== instanceToken) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req, serverId, meta);
+    });
+  } catch (e) {
+    socket.destroy();
+  }
+});
+
+wss.on('connection', (ws, req, serverId, meta) => {
+  log('WebSocket console connected for', serverId, 'from', req.socket.remoteAddress);
+  // Send welcome message
+  ws.send(JSON.stringify({ event: 'welcome', server_id: serverId, pid: meta.pid }));
+
+  // Authenticated flag and user info
+  ws._authenticated = false;
+  ws._user = null;
+
+  ws.on('message', (data) => {
+    let text = data;
+    if (Buffer.isBuffer(data)) text = data.toString('utf8');
+
+    // Attempt to parse JSON message event
+    let msg = null;
+    try { msg = JSON.parse(text); } catch (e) { msg = null; }
+
+    // Handle auth event: { event: 'auth', args: ['<token>'] }
+    if (msg && msg.event === 'auth' && Array.isArray(msg.args) && msg.args.length > 0) {
+      const token = msg.args[0];
+      const verified = verifyWsToken(token, serverId);
+      if (!verified.valid) {
+        ws.send(JSON.stringify({ event: 'jwt error', args: [verified.reason || 'invalid token'] }));
+        ws.close();
+        return;
+      }
+      ws._authenticated = true;
+      ws._user = verified.payload.user_uuid || null;
+      ws.send(JSON.stringify({ event: 'auth success' }));
+      return;
+    }
+
+    // If not authenticated, reject other messages
+    if (!ws._authenticated) {
+      ws.send(JSON.stringify({ event: 'jwt error', args: ['not authenticated'] }));
+      return;
+    }
+
+    // Treat authenticated incoming messages as console input
+    const serverDir = path.join('C:', 'Servers', `sbox-${serverId}`);
+    const consoleLog = path.join(serverDir, 'console.log');
+    const ts = new Date().toISOString();
+    fs.appendFileSync(consoleLog, `${ts}Z WS ${text}\n`, 'utf8');
+    // Echo back a stubbed response
+    ws.send(JSON.stringify({ event: 'stdout', data: `Stub response: ${text}` }));
+  });
+
+  ws.on('close', () => {
+    log('WebSocket console disconnected for', serverId);
+  });
+});
 process.on('uncaughtException', (err) => {
   log('uncaughtException', err.stack || err.message || err);
 });
