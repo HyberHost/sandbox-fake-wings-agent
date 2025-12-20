@@ -21,6 +21,10 @@ const express = require('express');
 const morgan = require('morgan');
 const child_process = require('child_process');
 const selfsigned = require('selfsigned');
+const cors = require('cors');
+const os = require('os');
+const yaml = require('js-yaml');
+const WebSocket = require('ws');
 
 const BASE = path.resolve(__dirname);
 const LOG_DIR = path.join(BASE, 'logs');
@@ -39,7 +43,44 @@ function log(...args) {
   daemonLog.write(line);
 }
 
+// Try loading cert/key from environment-configured paths (PEM or PFX exported by win-acme)
+function loadCertFromEnv() {
+  const certPath = process.env.SSL_CERT_PATH;
+  const keyPath = process.env.SSL_KEY_PATH;
+  const pfxPath = process.env.SSL_PFX_PATH;
+  const pfxPass = process.env.SSL_PFX_PASS;
+
+  if (pfxPath && fs.existsSync(pfxPath)) {
+    try {
+      log('Loading PFX from', pfxPath);
+      const pfx = fs.readFileSync(pfxPath);
+      return { pfx, passphrase: pfxPass };
+    } catch (e) {
+      log('Failed to load PFX:', e.message);
+    }
+  }
+
+  if (certPath && keyPath && fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+    try {
+      log('Loading PEM cert/key from', certPath, keyPath);
+      const cert = fs.readFileSync(certPath);
+      const key = fs.readFileSync(keyPath);
+      return { cert, key };
+    } catch (e) {
+      log('Failed to load PEM files:', e.message);
+    }
+  }
+
+  return null;
+}
+
 function ensureCert(keySize = 2048, force = false) {
+  // If env-provided certs exist prefer them
+  const envCert = loadCertFromEnv();
+  if (envCert) {
+    return envCert;
+  }
+
   if (!force && fs.existsSync(SSL_CERT) && fs.existsSync(SSL_KEY)) {
     log('Using existing SSL cert');
     return { cert: fs.readFileSync(SSL_CERT), key: fs.readFileSync(SSL_KEY) };
@@ -53,12 +94,40 @@ function ensureCert(keySize = 2048, force = false) {
   return { cert: pems.cert, key: pems.private };
 }
 
+let WINGS_CONFIG = null;
+
+function loadWingsConfig() {
+  const configPath = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.yml';
+  if (!fs.existsSync(configPath)) return null;
+  try {
+    const raw = fs.readFileSync(configPath, 'utf8');
+    const parsed = (configPath.endsWith('.yml') || configPath.endsWith('.yaml')) ? yaml.load(raw) : JSON.parse(raw);
+    log('Loaded wings config from', configPath);
+    return parsed;
+  } catch (e) {
+    log('Failed to parse wings config at', configPath, e.message);
+    return null;
+  }
+}
+
+// Load config at startup if present
+WINGS_CONFIG = loadWingsConfig();
+
+function getNodeToken() {
+  // precedence: PANEL_TOKEN env (explicit), WINGS_TOKEN env, token in config
+  if (process.env.PANEL_TOKEN && process.env.PANEL_TOKEN !== '') return process.env.PANEL_TOKEN;
+  if (process.env.WINGS_TOKEN && process.env.WINGS_TOKEN !== '') return process.env.WINGS_TOKEN;
+  if (WINGS_CONFIG && (WINGS_CONFIG.token || WINGS_CONFIG.api && WINGS_CONFIG.api.token)) return WINGS_CONFIG.token || (WINGS_CONFIG.api && WINGS_CONFIG.api.token);
+  return '';
+}
+
 function requireAuth(req, res) {
-  if (!PANEL_TOKEN) return true;
+  const nodeToken = getNodeToken();
+  if (!nodeToken) return true; // no token configured -> allow for local testing
   const auth = req.get('authorization') || '';
   if (!auth.startsWith('Bearer ')) return false;
   const token = auth.split(' ')[1].trim();
-  return token === PANEL_TOKEN;
+  return token === nodeToken;
 }
 
 function serverMetaPath(serverId) {
@@ -102,7 +171,16 @@ function spawnPowershellScript(scriptPath, args = []) {
 
 const app = express();
 app.use(express.json());
+app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Authorization','Content-Type'] }));
 app.use(morgan('combined', { stream: { write: (s) => daemonLog.write(s) } }));
+
+// Allow preflight requests to pass without auth
+app.options('/api/*', (req, res) => {
+  res.set('Access-Control-Allow-Origin','*');
+  res.set('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers','Authorization,Content-Type');
+  res.sendStatus(204);
+});
 
 // Auth middleware
 app.use((req, res, next) => {
@@ -147,6 +225,93 @@ app.post('/api/servers/:serverId/command', (req, res) => {
   return res.status(202).json({ result: 'queued' });
 });
 
+// Root and system endpoints
+app.get('/', (req, res) => {
+  res.send('Mock Wings daemon');
+});
+
+app.get('/api/system', (req, res) => {
+  const config = WINGS_CONFIG; // loaded at startup if present
+
+  // If ?v=2 request, return richer structured information (mirrors wings GetSystemInformation v=2)
+  if (req.query.v === '2') {
+    const sys = {
+      version: '0.1.0-fake',
+      docker: {
+        version: { Version: 'unknown' },
+        cgroups: { driver: 'unknown', version: 'unknown' },
+        containers: { total: 0, running: 0, paused: 0, stopped: 0 },
+        storage: { driver: 'unknown', filesystem: 'unknown' },
+        runc: { version: 'unknown' }
+      },
+      system: {
+        architecture: process.arch,
+        cpu_threads: os.cpus() ? os.cpus().length : 1,
+        memory_bytes: os.totalmem ? os.totalmem() : 0,
+        kernel_version: os.release(),
+        os: os.type(),
+        os_type: os.platform()
+      }
+    };
+
+    const response = {
+      version: sys.version,
+      docker: {
+        version: sys.docker.version, // keep shape similar
+        cgroups: { driver: sys.docker.cgroups.driver, version: sys.docker.cgroups.version },
+        containers: sys.docker.containers,
+        storage: sys.docker.storage,
+        runc: sys.docker.runc
+      },
+      system: sys.system
+    };
+
+    log('GET /api/system?v=2 ->', config?.uuid || process.env.WINGS_UUID || 'no-uuid');
+    return res.json(response);
+  }
+
+  const response = {
+    debug: config?.debug ?? false,
+    uuid: config?.uuid || process.env.WINGS_UUID || process.env.NODE_UUID || null,
+    token_id: config?.token_id || process.env.WINGS_TOKEN_ID || null,
+    token: config?.token || process.env.WINGS_TOKEN || process.env.NODE_TOKEN || null,
+    api: config?.api || { host: '0.0.0.0', port: 8080, ssl: { enabled: true } },
+    system: config?.system || {},
+    remote: config?.remote || process.env.PANEL_REMOTE || null
+  };
+
+  log('GET /api/system ->', response.uuid || 'no-uuid');
+  res.json(response);
+});
+
+app.options('/api/system', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  res.sendStatus(204);
+});
+
+// Allow the panel to POST new configuration (mirrors wings /api/update)
+app.post('/api/update', (req, res) => {
+  const cfg = req.body || {};
+  const configPath = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.yml';
+
+  try {
+    // If the path looks like a YAML file, write as YAML; otherwise write JSON
+    if (configPath.endsWith('.yml') || configPath.endsWith('.yaml')) {
+      fs.writeFileSync(configPath, yaml.dump(cfg), 'utf8');
+    } else {
+      fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), 'utf8');
+    }
+    WINGS_CONFIG = cfg; // update in-memory copy
+    log('Updated wings config and persisted to', configPath);
+    return res.json({ applied: true });
+  } catch (e) {
+    log('Failed to write wings config to', configPath, e.message);
+    return res.status(500).json({ applied: false, error: e.message });
+  }
+});
+
 // Start HTTPS server
 let { cert, key } = ensureCert();
 let httpsServer;
@@ -164,10 +329,82 @@ try {
     httpsServer = https.createServer({ key, cert }, app);
     httpsServer.listen(8080, '0.0.0.0', () => {
       log('Mock Wings daemon listening on https://0.0.0.0:8080 (using 4096-bit cert)');
+    // Setup WebSocket server upgrade handling for console websockets
+    const wss = new WebSocket.Server({ noServer: true });
+
+    httpsServer.on('upgrade', (req, socket, head) => {
+      try {
+        const url = new URL(req.url, `https://${req.headers.host}`);
+        const pathname = url.pathname;
+        const match = pathname.match(/^\/api\/servers\/([^\/]+)\/ws$/);
+        if (!match) {
+          socket.destroy();
+          return;
+        }
+        const serverId = match[1];
+
+        // Simple token auth: check query param 'token' or Authorization header
+        const tokenQuery = url.searchParams.get('token');
+        const authHeader = req.headers['authorization'] || '';
+        const bearer = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1].trim() : '';
+
+        // Read server metadata
+        const metaPath = path.join('C:', 'Servers', `sbox-${serverId}`, 'server.json');
+        let meta = null;
+        if (fs.existsSync(metaPath)) {
+          try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch (e) { meta = null; }
+        }
+
+        // Validate PID exists and is running
+        const pidValid = meta && meta.pid && !isNaN(parseInt(meta.pid, 10)) && isRunning(meta);
+        if (!pidValid) {
+          // Reject upgrade
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        // Validate token: accept if matches node token or instance_token
+        const nodeToken = getNodeToken();
+        const instanceToken = meta.instance_token || '';
+        if (nodeToken && bearer !== nodeToken && tokenQuery !== nodeToken && bearer !== instanceToken && tokenQuery !== instanceToken) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit('connection', ws, req, serverId, meta);
+        });
+      } catch (e) {
+        socket.destroy();
+      }
     });
-  } else {
-    throw err;
-  }
+
+    wss.on('connection', (ws, req, serverId, meta) => {
+      log('WebSocket console connected for', serverId, 'from', req.socket.remoteAddress);
+      // Send welcome message
+      ws.send(JSON.stringify({ type: 'welcome', server_id: serverId, pid: meta.pid }));
+
+      ws.on('message', (data) => {
+        // Treat incoming messages as stdin strings
+        let text = data;
+        if (Buffer.isBuffer(data)) text = data.toString('utf8');
+        const serverDir = path.join('C:', 'Servers', `sbox-${serverId}`);
+        const consoleLog = path.join(serverDir, 'console.log');
+        const ts = new Date().toISOString();
+        fs.appendFileSync(consoleLog, `${ts}Z WS ${text}\n`, 'utf8');
+        // Echo back a stubbed response
+        ws.send(JSON.stringify({ type: 'stdout', data: `Stub response: ${text}` }));
+      });
+
+      ws.on('close', () => {
+        log('WebSocket console disconnected for', serverId);
+      });
+    });
+
+  });
+    } else {
 }
 
 process.on('uncaughtException', (err) => {
