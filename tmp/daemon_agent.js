@@ -23,7 +23,6 @@ const child_process = require('child_process');
 const selfsigned = require('selfsigned');
 const cors = require('cors');
 const os = require('os');
-const yaml = require('js-yaml');
 const WebSocket = require('ws');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -100,22 +99,39 @@ function ensureCert(keySize = 2048, force = false) {
 }
 
 let WINGS_CONFIG = null;
+let WINGS_CONFIG_PATH_LOADED = null;
 
 function loadWingsConfig() {
-  const configPath = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.yml';
-  if (!fs.existsSync(configPath)) return null;
+  // JSON-only config handling. Default to C:/Agent/wings.json unless overridden.
+  const configured = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.json';
   try {
-    const raw = fs.readFileSync(configPath, 'utf8');
-    const parsed = (configPath.endsWith('.yml') || configPath.endsWith('.yaml')) ? yaml.load(raw) : JSON.parse(raw);
-    log('Loaded wings config from', configPath);
+    if (!fs.existsSync(configured)) return null;
+    const raw = fs.readFileSync(configured, 'utf8');
+    const parsed = JSON.parse(raw);
+    log('Loaded wings config from', configured);
+    WINGS_CONFIG_PATH_LOADED = configured;
     return parsed;
   } catch (e) {
-    log('Failed to parse wings config at', configPath, e.message);
+    log('Failed to load or parse wings config at', configured, e.message);
     return null;
   }
-}
+} 
 
 // Load config at startup if present
+
+function writeWingsConfig(cfg) {
+  const configured = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.json';
+  try {
+    fs.writeFileSync(configured, JSON.stringify(cfg, null, 2), 'utf8');
+    log('Persisted wings config to', configured);
+    return true;
+  } catch (e) {
+    log('Failed to persist wings config to', configured, e.message);
+    return false;
+  }
+} 
+
+// Do NOT auto-generate node tokens here. Tokens should come from Panel via /api/update or environment variables.
 WINGS_CONFIG = loadWingsConfig();
 
 function getNodeToken() {
@@ -178,6 +194,20 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Authorization','Content-Type'] }));
 app.use(morgan('combined', { stream: { write: (s) => daemonLog.write(s) } }));
+
+// Ensure daemon log has an initial banner so file is created and easy to find
+daemonLog.write(`[${new Date().toISOString()}] daemon starting\n`);
+
+// Simple request logger that writes an entry immediately to requests.log (helps debugging 504s)
+app.use((req, res, next) => {
+  try {
+    const entry = JSON.stringify({ t: new Date().toISOString(), ip: req.ip || req.socket.remoteAddress, method: req.method, url: req.originalUrl || req.url }) + '\n';
+    fs.appendFileSync(path.join(LOG_DIR, 'requests.log'), entry, 'utf8');
+  } catch (e) {
+    daemonLog.write(`[${new Date().toISOString()}] failed to write requests.log ${e.message}\n`);
+  }
+  next();
+});
 
 // Allow preflight requests to pass without auth
 app.options('/api/*', (req, res) => {
@@ -282,6 +312,15 @@ app.get('/api/system', (req, res) => {
   const kernelVersion = os.release();
   const osName = (config && (config.system && config.system.os)) ? config.system.os : os.type();
 
+  // Prefer token from configured sources (env/WINGS_CONFIG), but fall back to config.token if present
+  const nodeToken = getNodeToken() || config?.token || null;
+  const apiCfg = config?.api || { host: '0.0.0.0', port: 8080, ssl: { enabled: true } };
+  const sslInfo = {
+    enabled: apiCfg.ssl?.enabled ?? true,
+    cert: apiCfg.ssl?.cert || process.env.SSL_CERT_PATH || (fs.existsSync(SSL_CERT) ? SSL_CERT : null),
+    key: apiCfg.ssl?.key || process.env.SSL_KEY_PATH || (fs.existsSync(SSL_KEY) ? SSL_KEY : null)
+  };
+
   const response = {
     // v1-style compatible fields
     version: '0.1.0-fake',
@@ -290,13 +329,24 @@ app.get('/api/system', (req, res) => {
     kernel_version: kernelVersion,
     cpu_count: cpuCount,
 
-    // existing response body kept for richer clients
+    // identification and token fields
     debug: config?.debug ?? false,
     uuid: config?.uuid || process.env.WINGS_UUID || process.env.NODE_UUID || null,
     token_id: config?.token_id || process.env.WINGS_TOKEN_ID || null,
-    token: config?.token || process.env.WINGS_TOKEN || process.env.NODE_TOKEN || null,
-    api: config?.api || { host: '0.0.0.0', port: 8080, ssl: { enabled: true } },
-    system: config?.system || {},
+    token: nodeToken,
+
+    // path to the loaded config file (JSON preferred)
+    config_path: WINGS_CONFIG_PATH_LOADED || process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.json',
+
+    api: { host: apiCfg.host, port: apiCfg.port, ssl: sslInfo, upload_limit: apiCfg.upload_limit || 100 },
+
+    system: Object.assign({}, config?.system || {}, {
+      data: (config?.system && config.system.data) ? config.system.data : path.join(SERVERS_ROOT),
+      sftp: { bind_port: config?.system?.sftp?.bind_port || (process.env.SFTP_PORT ? parseInt(process.env.SFTP_PORT, 10) : 2022) }
+    }),
+
+    allowed_mounts: config?.allowed_mounts || [],
+
     remote: config?.remote || process.env.PANEL_REMOTE || null
   };
 
@@ -314,16 +364,12 @@ app.options('/api/system', (req, res) => {
 // Allow the panel to POST new configuration (mirrors wings /api/update)
 app.post('/api/update', (req, res) => {
   const cfg = req.body || {};
-  const configPath = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.yml';
+  const configPath = process.env.WINGS_CONFIG_PATH || 'C:/Agent/wings.json';
 
   try {
-    // If the path looks like a YAML file, write as YAML; otherwise write JSON
-    if (configPath.endsWith('.yml') || configPath.endsWith('.yaml')) {
-      fs.writeFileSync(configPath, yaml.dump(cfg), 'utf8');
-    } else {
-      fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), 'utf8');
-    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), 'utf8');
     WINGS_CONFIG = cfg; // update in-memory copy
+    WINGS_CONFIG_PATH_LOADED = configPath;
     log('Updated wings config and persisted to', configPath);
     return res.json({ applied: true });
   } catch (e) {
